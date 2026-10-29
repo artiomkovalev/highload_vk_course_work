@@ -820,23 +820,28 @@ QPS чтения указаны на уровне приложения; QPS к �
 flowchart TB
     APP[Сервисы k8s] --> PB[PgBouncer, transaction pooling]
     PB --> SH
-    subgraph SH [PostgreSQL 16 (Postgres Pro): 12 шардов по region_id]
+
+    subgraph SH [PostgreSQL 16 Postgres Pro: 12 шардов по region_id]
         S1[МСК-1: мастера шардов 1-4<br/>sync МСК-2, async НСК]
         S2[МСК-2: мастера шардов 5-8<br/>sync МСК-1, async НСК]
-        S3[НСК: мастера шардов 9-12<br/>sync МСК-1, async МСК-2]
+        S3_DB[НСК: мастера шардов 9-12<br/>sync МСК-1, async МСК-2]
     end
+
     APP --> RC[Valkey 8.0 Redis 2+2 на площадку<br/>кэш дневника, сессии]
     APP --> K[Kafka 9 брокеров 3/3/3<br/>grade.events, hw.events, notif, sync]
     APP --> OS[OpenSearch 6 узлов 2/2/2<br/>content_items индекс]
     APP --> CH[ClickHouse 4 узла 2/1/1<br/>analytics_events]
     APP --> CAS[Cassandra 9 узлов 3/3/3<br/>notifications, RF 3]
     APP --> MGO[MongoDB RS 3 узла<br/>portfolio, documents]
-    APP --> S3[Ceph RGW: пул МСК 12 узлов, пул НСК 6<br/>EC 4+2]
+    APP --> CEPH[Ceph RGW: пул МСК 12 узлов, пул НСК 6<br/>EC 4+2]
+
     K --> CH
     K --> NOTIF[svc уведомлений]
     K --> SYNC[адаптеры региональных ГИС]
-    S3 --> OSDR[DR-репликация пулов МСК ↔ НСК]
-    S1 & S2 & S3 --> BKP[pgBackRest → S3 другой площадки<br/>WAL непрерывно]
+    
+    CEPH --> OSDR[DR-репликация пулов МСК ↔ НСК]
+    S1 & S2 & S3_DB --> BKP[pgBackRest → S3 другой площадки<br/>WAL непрерывно]
+
 ```
 
 Выбор СУБД по умолчанию - PostgreSQL: он закреплён ТЗ тендера [1] и покрывает реляционный журнальный контур. СУБД других моделей допускаются там, где модель данных или профиль нагрузки дают измеримый выигрыш; для каждого исключения ниже указан выигрыш и проверка по правилу шардирования (§6.3).
