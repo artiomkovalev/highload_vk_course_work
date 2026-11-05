@@ -1067,8 +1067,8 @@ flowchart TB
         ING[L7: nginx ingress, SSL]
     end
 
-    subgraph CORE [k8s: федеральное ядро]
-        GW[API-шлюз: проверка сессии, rate-limit]
+    subgraph CORE [k8s: синхронный контур - путь ответа пользователю]
+        GW[API-шлюз: сессия, rate-limit]
         AUTH[svc авторизации]
         DIARY[svc дневника]
         JOURNAL[svc журнала]
@@ -1077,61 +1077,99 @@ flowchart TB
         SRCH[svc поиска]
         TST[svc тестов]
         PORT[svc портфолио/документов]
-        NOTIF[svc уведомлений]
+        NOTIF[svc уведомлений: чтение ленты]
+    end
+
+    subgraph WORKERS [k8s: асинхронные воркеры - потребители Kafka]
         INV[инвалидатор кэша]
-        SYNC[адаптеры региональных ГИС]
+        NDISP[диспетчер push-уведомлений]
         PIPE[content-pipeline: ClamAV, ffmpeg]
+        SYNC[адаптеры региональных ГИС]
+        ETL[экспортёр аналитики в ClickHouse]
     end
 
     subgraph DATA [Хранилища]
-        RDS[(Redis Cluster)]
+        RDS[(Valkey: кэш, сессии)]
         PG[(PG 12 шардов + Patroni)]
         CAS[(Cassandra: notifications)]
         MGO[(MongoDB: portfolio, docs)]
-        KF[[Kafka]]
+        KF{{Kafka: journal.events, hw.events, content.pipeline, regional, audit}}
         OS[(OpenSearch)]
-        CH[(ClickHouse)]
-        S3[(Ceph S3)]
+        CH[(ClickHouse: аналитика, аудит)]
+        S3[(Ceph S3: контент, бэкапы, WORM)]
     end
 
-    EXT[ЕСИА / push-шлюзы / ФРДО]
+    EXT[ЕСИА / push-шлюзы RuStore, APNs, FCM / ФРДО]
 
-    WEB & MOB --> DNS
-    DNS --> L4 --> ING --> GW
-    MOB & WEB --> CDN
-    CDN --> S3
-    GW --> AUTH & DIARY & JOURNAL & HW & LIB & SRCH & TST & PORT & NOTIF
-    AUTH --> EXT
+    subgraph LEGEND [Легенда]
+        L1[сплошная стрелка - синхронный вызов]
+        L2[пунктирная - событие Kafka, асинхронный контур]
+    end
+
+    %% --- синхронные вызовы ---
+    WEB --> DNS
+    MOB --> DNS
+    WEB --> CDN
+    MOB --> CDN
+    DNS --> L4
+    L4 --> ING
+    ING --> GW
+    GW --> AUTH
+    GW --> DIARY
+    GW --> JOURNAL
+    GW --> HW
+    GW --> LIB
+    GW --> SRCH
+    GW --> TST
+    GW --> PORT
+    GW --> NOTIF
     AUTH --> RDS
-    DIARY --> RDS
+    AUTH -->|вход через ЕСИА| EXT
+    DIARY -->|кэш дневника| RDS
+    DIARY -->|сборка при промахе| PG
     JOURNAL --> PG
-    JOURNAL --> KF
     HW --> PG
-    LIB --> PG
-    LIB --> S3
-    SRCH --> OS
     TST --> PG
+    LIB -->|поиск материалов| SRCH
+    SRCH --> OS
     PORT --> MGO
-    PORT --> S3
-    NOTIF --> CAS
-    NOTIF --> EXT
-    KF --> INV
-    INV --> RDS
-    KF --> NOTIF
-    KF --> CH
-    KF --> SYNC
-    SYNC <--> REG
-    PIPE --> S3
-    PIPE --> OS
-    DIARY & HW & TST --> PG
+    PORT -->|сертификаты, файлы| S3
+    NOTIF -->|лента пользователя| CAS
+    CDN -->|origin fetch| S3
+    MOB -->|multipart PUT по pre-signed| S3
+    SYNC <-->|исходящие и входящие батчи| REG
+    PIPE -->|HLS, карантин| S3
+    PIPE -->|индексация| OS
+    NDISP -->|push с ретраями| EXT
+    NDISP -->|запись ленты| CAS
+    SYNC -->|применение изменений| PG
+    ETL --> CH
+    INV -->|удаление ключей| RDS
+
+    %% --- асинхронные события Kafka ---
+    JOURNAL -.->|journal.events, audit| KF
+    HW -.->|hw.events| KF
+    KF -.-> INV
+    KF -.-> NDISP
+    KF -.->|content.pipeline| PIPE
+    KF -.->|regional| SYNC
+    KF -.->|analytics| ETL
+
+    classDef worker fill:#fff3e0,stroke:#e65100,color:#000
+    classDef storage fill:#e3f2fd,stroke:#1565c0,color:#000
+    class INV,NDISP,PIPE,SYNC,ETL worker
+    class RDS,PG,CAS,MGO,KF,OS,CH,S3 storage
+    linkStyle 38,39,40,41,42,43,44 stroke:#e65100,stroke-width:2px
 ```
 
-**Потоки данных:**
+Разделение контуров: сплошные стрелки - вызовы в пути ответа пользователю; пунктирные - события Kafka. Всё, что не нужно пользователю в момент запроса, вынесено в воркеры и выполняется асинхронно: запись журнала синхронно пишет микробатч в PG и публикует событие, а инвалидация кэша, push-уведомления, конвертация контента, обмен с регионами и аналитика догоняют в фоне - отказ любого воркера не влияет на latency пользовательских запросов, недоставленное копится в очереди (§9). Файлы не проходят через сервисы: клиент грузит multipart прямо в S3 по краткосрочному креденшелу OpenBao, чтение идёт через CDN с origin на Ceph.
+
+**Ключевые потоки данных:**
 
 1. **Чтение дневника - основной поток, ~70% RPS.** Клиент через GeoDNS попадает на ближний ДЦ, проходит L4 и L7 nginx с SSL-терминацией, затем API-шлюз, где проверяется сессия по кэшу Redis и работают rate-limit'ы. svc дневника отвечает из кэша Redis с попаданием ~85%, промах собирается из партиций PG по region_id. Ответ - 20-50 КБ JSON;
-2. **Запись журнала.** Учитель → svc журнала → микробатч 100 мс → master PG шарда → событие в Kafka `journal.events`. Дальше параллельно: инвалидатор чистит кэш дневников класса (§7.1), svc уведомлений материализует push (§7.4), ClickHouse накапливает статистику. Обмен с региональными ГИС описан в §7.5;
+2. **Запись журнала.** Учитель → svc журнала → микробатч 100 мс → master PG шарда → событие в Kafka `journal.events`. Дальше параллельно: инвалидатор чистит кэш дневников класса (§7.1), диспетчер уведомлений материализует push (§7.4), ClickHouse накапливает статистику. Обмен с региональными ГИС описан в §7.5;
 3. **Контент.** При просмотре клиент получает от svc библиотеки signed URL на CDN; отдачу ведут узлы CDN с ~80% кэш-хитов, origin - Ceph. Загрузка идёт multipart в Ceph по краткосрочным креденшелам OpenBao, затем content-pipeline выполняет антивирус, конвертацию и HLS, индексирует материал в OpenSearch и ставит статус `ready` в PG;
-4. **Уведомления.** События Kafka → svc уведомлений → PG, лента с семантикой at-least-once → внешние push-шлюзы с ретраями; «тихие часы» выставляются по часовому поясу региона;
+4. **Уведомления.** События Kafka → диспетчер push (воркер) → Cassandra: лента с семантикой at-least-once → внешние push-шлюзы с ретраями; чтение ленты пользователь делает синхронно из svc уведомлений. «Тихие часы» выставляются по часовому поясу региона;
 5. **Балансировка.** Внешняя - GeoDNS по гео-зонам 40/34/26 и CDN по всей стране. Внутренняя - ECMP на роутерах, VIP на L4, active-active на nginx, распределение по подам в k8s с HPA по CPU/RPS; PgBouncer и HAProxy раскидывают чтения по репликам шарда;
 6. **Аналитика.** События из Kafka оседают в ClickHouse - статистика учителя, отчёты школ, агрегаты посещаемости после двухлетнего ретеншена - без нагрузки на OLTP.
 
